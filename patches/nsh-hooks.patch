@@ -1,0 +1,162 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index e66ff5d..ddaba10 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3968,6 +3968,39 @@ dependencies = [
+  "wuff",
+ ]
+ 
++[[package]]
++name = "nsh-ns"
++version = "0.1.0"
++dependencies = [
++ "cc",
++ "dispatch2",
++ "env_logger",
++ "nsh-base",
++ "nsh-core",
++ "nsh-engine",
++ "nsh-js",
++ "nsh-platform-ios",
++ "nsh-platform-macos",
++ "objc2",
++ "objc2-app-kit",
++ "objc2-foundation",
++ "objc2-ui-kit",
++ "serde_json",
++]
++
++[[package]]
++name = "nsh-ns-android"
++version = "0.1.0"
++dependencies = [
++ "cc",
++ "jni",
++ "nsh-base",
++ "nsh-core",
++ "nsh-engine",
++ "nsh-js",
++ "nsh-platform-android",
++]
++
+ [[package]]
+ name = "nsh-package"
+ version = "0.4.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index d50f091..2133b2f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,6 +1,6 @@
+ [workspace]
+ resolver = "3"
+-members = ["crates/*", "examples/gallery-rs/native", "examples/rust-exports/native", "examples/tasks-rs", "examples/embed-gpui/run"]
++members = ["crates/*", "examples/gallery-rs/native", "examples/rust-exports/native", "examples/tasks-rs", "examples/embed-gpui/run", "../../crates/nsh-ns", "../../crates/nsh-ns-android"]
+ # The GPUI backend is a workspace of its own (`crates/gpui/Cargo.toml`).
+ exclude = ["crates/gpui"]
+ # `cargo run` runs the gallery (`crates/xtask/src/run.rs`).
+diff --git a/crates/nsh-engine/src/lib.rs b/crates/nsh-engine/src/lib.rs
+index 68c88ec..2001de5 100644
+--- a/crates/nsh-engine/src/lib.rs
++++ b/crates/nsh-engine/src/lib.rs
+@@ -1209,6 +1209,17 @@ const MAX_ADVANCE_ROUNDS: usize = 100_000;
+ /// once): a task that keeps waking itself leaves the engine busy.
+ const MAX_FLUSH_ROUNDS: usize = 64;
+ 
++static ENGINE_RUNNER: std::sync::Mutex<Option<Sender<Message>>> = std::sync::Mutex::new(None);
++
++/// Runs `run` on the thread of the engine started last, between its turns.
++/// False when no engine is running.
++pub fn run_on_engine(run: Box<dyn FnOnce() + Send>) -> bool {
++    match &*ENGINE_RUNNER.lock().unwrap_or_else(|e| e.into_inner()) {
++        Some(tx) => tx.send(Message::Run(run)).is_ok(),
++        None => false,
++    }
++}
++
+ enum Message {
+     Event(NodeId, EventKind, EventPayload),
+     Scroll(NodeId, Point<Points>, u32),
+@@ -1221,6 +1232,8 @@ enum Message {
+     Resize(Size<Points>),
+     /// A component's task was woken: it runs in the loop.
+     Wake,
++    /// Code from another thread that must run on the engine thread.
++    Run(Box<dyn FnOnce() + Send>),
+     /// Boxed: with the locale settings held inline, an
+     /// environment is several times the size of every other message, and
+     /// it changes rarely.
+@@ -1532,6 +1545,7 @@ impl Engine {
+     {
+         let image_cache = config.cache.open_images(config.app.app_id());
+         let (tx, rx) = crossbeam_channel::unbounded();
++        *ENGINE_RUNNER.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx.clone());
+         setup(&EngineControl { tx: tx.clone() });
+         let engine_tx = tx.clone();
+         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+@@ -3530,6 +3544,7 @@ fn handle<M: TextEngine>(script: Option<&Script>, state: &mut State<M>, message:
+             state.resized = Some(size);
+         }
+         Message::Wake => {}
++        Message::Run(run) => run(),
+         Message::Environment(mut env) => {
+             state.pinned.apply(&mut env);
+             let env = state.window_state.report(*env, nsh_core::time::now());
+diff --git a/crates/nsh-js/src/host.rs b/crates/nsh-js/src/host.rs
+index a97e4f4..db4e218 100644
+--- a/crates/nsh-js/src/host.rs
++++ b/crates/nsh-js/src/host.rs
+@@ -191,6 +191,7 @@ impl Host {
+             crate::standard::install(&cx)?;
+             // Before hardening freezes the globals.
+             crate::clock::install(&cx)?;
++            crate::run_context_hook(cx.as_raw().as_ptr().cast());
+             if options.harden {
+                 sandbox::harden(&cx)?;
+             }
+@@ -284,7 +285,12 @@ impl Host {
+                 .ready(rt.set_host_promise_rejection_tracker(None));
+         }
+         self.shared.rejections.borrow_mut().clear();
+-        self.rt.borrow_mut().take();
++        let runtime = self.rt.borrow_mut().take();
++        // What a context hook installed may hold VM objects for the life of
++        // the process, and JS_FreeRuntime aborts on any that remain.
++        if crate::has_context_hook() {
++            std::mem::forget(runtime);
++        }
+     }
+ 
+     /// What an error from a call means: an overrun budget or exhausted
+diff --git a/crates/nsh-js/src/lib.rs b/crates/nsh-js/src/lib.rs
+index 50378a0..b537f0a 100644
+--- a/crates/nsh-js/src/lib.rs
++++ b/crates/nsh-js/src/lib.rs
+@@ -72,6 +72,28 @@ pub use crate::{
+     net::{FetchEvent, FetchOp, HttpBody, HttpHead, HttpRequest, NetworkQueue, RequestId},
+ };
+ 
++/// Called with each new VM's `JSContext` (as a raw pointer) on the engine
++/// thread, after the standard modules are installed and before hardening
++/// freezes the globals.
++pub type ContextHook = fn(*mut std::ffi::c_void);
++
++static CONTEXT_HOOK: std::sync::OnceLock<ContextHook> = std::sync::OnceLock::new();
++
++/// Sets the hook every VM created afterwards runs.
++pub fn set_context_hook(hook: ContextHook) {
++    let _ = CONTEXT_HOOK.set(hook);
++}
++
++pub(crate) fn has_context_hook() -> bool {
++    CONTEXT_HOOK.get().is_some()
++}
++
++pub(crate) fn run_context_hook(context: *mut std::ffi::c_void) {
++    if let Some(hook) = CONTEXT_HOOK.get() {
++        hook(context);
++    }
++}
++
+ /// The names native module `specifier` exports, if it is one: nsh's own
+ /// modules, the runtime's and those of `ui_sets` (a bundler checks named
+ /// imports against them).

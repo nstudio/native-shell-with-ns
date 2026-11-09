@@ -1,0 +1,7 @@
+vendor/
+rt/
+.nsh/
+node_modules/
+*.log
+.DS_Store
+apps/android-host/jniLibs/**/*.so

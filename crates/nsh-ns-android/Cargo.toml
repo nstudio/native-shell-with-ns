@@ -1,0 +1,25 @@
+[package]
+name = "nsh-ns-android"
+version = "0.1.0"
+edition = "2024"
+publish = false
+workspace = "../../vendor/nsh"
+
+[lib]
+name = "nsh_android_host"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[features]
+dev = ["nsh-platform-android/dev"]
+
+[dependencies]
+nsh-js = { path = "../../vendor/nsh/crates/nsh-js", default-features = false }
+nsh-engine = { path = "../../vendor/nsh/crates/nsh-engine" }
+nsh-platform-android = { path = "../../vendor/nsh/crates/nsh-platform-android" }
+jni = { workspace = true }
+nsh-core = { workspace = true }
+nsh-base = { workspace = true }
+
+[build-dependencies]
+cc = "1"

@@ -1,0 +1,291 @@
+diff --git a/NativeScript/ffi/jni/napi/objectmanager/ObjectManager.cpp b/NativeScript/ffi/jni/napi/objectmanager/ObjectManager.cpp
+index e07f68f..0a31bef 100644
+--- a/NativeScript/ffi/jni/napi/objectmanager/ObjectManager.cpp
++++ b/NativeScript/ffi/jni/napi/objectmanager/ObjectManager.cpp
+@@ -1080,6 +1080,12 @@ void ObjectManager::OnGarbageCollected(JNIEnv *jEnv, jintArray object_ids) {
+     auto rt = Runtime::GetRuntimeUnchecked(m_env);
+     if (!rt || rt->is_destroying) return;
+ 
++#ifdef NSH_EXTERNAL_ENGINE
++    // Called on NativeScript's GC monitor thread, while the host's engine
++    // thread may be running JS.
++    NapiScope scope(m_env);
++#endif
++
+     jsize length = jenv.GetArrayLength(object_ids);
+     jint *cppArray = jenv.GetIntArrayElements(object_ids, nullptr);
+     if (cppArray == nullptr) return;
+diff --git a/NativeScript/napi/quickjs/jsr.cpp b/NativeScript/napi/quickjs/jsr.cpp
+index d65b4e6..6d4b3d0 100644
+--- a/NativeScript/napi/quickjs/jsr.cpp
++++ b/NativeScript/napi/quickjs/jsr.cpp
+@@ -40,13 +40,28 @@ napi_status js_set_runtime_flags(const char *flags) {
+     return napi_ok;
+ }
+ 
++#ifdef NSH_EXTERNAL_ENGINE
++// The host app owns the VM and runs its job queue: entering it from Java is a
++// hand-off to the host rather than a lock.
++extern "C" void nsh_android_enter_vm();
++extern "C" void nsh_android_leave_vm();
++#endif
++
+ napi_status js_lock_env(napi_env env) {
++#ifdef NSH_EXTERNAL_ENGINE
++    nsh_android_enter_vm();
++    return napi_ok;
++#endif
+     auto jsr = JSR::env_to_jsr_cache.Get(env);
+     if (jsr) jsr->lock();
+     return napi_ok;
+ }
+ 
+ napi_status js_unlock_env(napi_env env) {
++#ifdef NSH_EXTERNAL_ENGINE
++    nsh_android_leave_vm();
++    return napi_ok;
++#endif
+     auto jsr = JSR::env_to_jsr_cache.Get(env);
+     if (jsr) jsr->unlock();
+ 
+@@ -124,6 +139,9 @@ napi_status js_execute_script(napi_env env, napi_value script, const char* file,
+ }
+ 
+ napi_status js_execute_pending_jobs(napi_env env) {
++#ifdef NSH_EXTERNAL_ENGINE
++    return napi_ok;
++#endif
+     return qjs_execute_pending_jobs(env);
+ }
+ 
+diff --git a/NativeScript/runtime/android/napi/Runtime.cpp b/NativeScript/runtime/android/napi/Runtime.cpp
+index 382b562..8cc74b6 100644
+--- a/NativeScript/runtime/android/napi/Runtime.cpp
++++ b/NativeScript/runtime/android/napi/Runtime.cpp
+@@ -118,7 +118,9 @@ void Runtime::Init(JavaVM *vm) {
+         sigemptyset(&action.sa_mask);
+         action.sa_flags = 0;
+         action.sa_handler = SIGHandler;
++        #ifndef NSH_EXTERNAL_ENGINE
+         sigaction(SIGABRT, &action, NULL);
++        #endif
+ #ifndef __JSC__
+         // JavaScriptCore installs and relies on its OWN SIGSEGV handler for normal,
+         // non-fatal operation (concurrent GC / JIT). Overwriting it with a handler
+@@ -128,7 +130,9 @@ void Runtime::Init(JavaVM *vm) {
+         // SIGSEGV to a JS exception (the only such spec is disabled via xit), so on
+         // JSC we leave SIGSEGV to the engine. SIGABRT (which JSC does not use) is
+         // still converted. On every other engine both are converted as before.
++        #ifndef NSH_EXTERNAL_ENGINE
+         sigaction(SIGSEGV, &action, NULL);
++        #endif
+ #endif
+     }
+ 
+diff --git a/platforms/android/test-app/app/build.gradle b/platforms/android/test-app/app/build.gradle
+index aee8db9..27cb832 100644
+--- a/platforms/android/test-app/app/build.gradle
++++ b/platforms/android/test-app/app/build.gradle
+@@ -259,7 +259,8 @@ android {
+     }
+ 
+     sourceSets.main {
+-        jniLibs.srcDirs = ["$projectDir/libs/jni", "$projectDir/snapshot-build/build/ndk-build/libs", "$projectDir/src/main/jniLibs"]
++        java.srcDirs += ["$rootDir/../../../../../vendor/nsh/crates/nsh-platform-android/java", "$rootDir/../../../../../apps/android-host/java"]
++        jniLibs.srcDirs = ["$rootDir/../../../../../apps/android-host/jniLibs", "$projectDir/libs/jni", "$projectDir/snapshot-build/build/ndk-build/libs", "$projectDir/src/main/jniLibs"]
+     }
+ 
+     packagingOptions {
+@@ -312,7 +313,7 @@ android {
+             if (project.hasProperty("nsFilterMetadata")) {
+                 minifyEnabled true
+                 proguardFiles getDefaultProguardFile("proguard-android.txt"),
+-                        METADATA_KEEP_RULES
++                        METADATA_KEEP_RULES, "proguard-rules.pro"
+             }
+         }
+     }
+@@ -877,13 +878,17 @@ def nsFilterMetadata = project.hasProperty("nsFilterMetadata")
+ // generated seed existed -- writing the seed there overwrote that file, and
+ // turning filtering off deleted it.
+ def nsGeneratedSeed = file("$projectDir/build/nativescript/generated-whitelist.mdg")
++// Apps whose JS is bundled elsewhere than APP_DIR point the seed at it here.
++def nsFilterMetadataInput = project.hasProperty("nsFilterMetadataInput")
++        ? project.property("nsFilterMetadataInput")
++        : APP_DIR
+ 
+ task generateMetadataSeed {
+     def seedScript = "$BUILD_TOOLS_PATH/metadata-filter/seed.js"
+     def generatedSeed = nsGeneratedSeed
+ 
+     inputs.property("enabled", nsFilterMetadata)
+-    inputs.dir(APP_DIR)
++    inputs.dir(nsFilterMetadataInput)
+     inputs.files(fileTree("$projectDir/src/main/res"))
+     inputs.files(fileTree("$BUILD_TOOLS_PATH/metadata-filter") { include "*.js" })
+     outputs.file(generatedSeed)
+@@ -903,7 +908,7 @@ task generateMetadataSeed {
+ 
+         generatedSeed.parentFile.mkdirs()
+ 
+-        def cmd = ["node", seedScript, APP_DIR,
++        def cmd = ["node", seedScript, nsFilterMetadataInput,
+                    "--manifest", "$projectDir/src/main/AndroidManifest.xml",
+                    "--out", generatedSeed.absolutePath]
+ 
+diff --git a/platforms/android/test-app/app/proguard-rules.pro b/platforms/android/test-app/app/proguard-rules.pro
+index f1b4245..aa50666 100644
+--- a/platforms/android/test-app/app/proguard-rules.pro
++++ b/platforms/android/test-app/app/proguard-rules.pro
+@@ -19,3 +19,7 @@
+ # If you keep the line number information, uncomment this to
+ # hide the original source file name.
+ #-renamesourcefileattribute SourceFile
++
++# Reached from native code by name, which R8 cannot see.
++-keep class com.longbridge.nsh.** { *; }
++-keep class dev.nstudio.nshns.** { *; }
+diff --git a/platforms/android/test-app/app/src/main/AndroidManifest.xml b/platforms/android/test-app/app/src/main/AndroidManifest.xml
+index bd80c3a..6666d17 100644
+--- a/platforms/android/test-app/app/src/main/AndroidManifest.xml
++++ b/platforms/android/test-app/app/src/main/AndroidManifest.xml
+@@ -9,14 +9,13 @@
+ 
+     <application
+ 	android:requestLegacyExternalStorage="true"
+-        android:name="com.tns.NativeScriptApplication"
+         android:allowBackup="true"
+         android:icon="@mipmap/ic_launcher"
+         android:label="@string/app_name"
+         android:roundIcon="@mipmap/ic_launcher_round"
+         android:supportsRtl="true"
+         android:theme="@style/AppTheme">
+-        <activity android:name="com.tns.NativeScriptActivity" android:exported="true">
++        <activity android:name="dev.nstudio.nshns.MainActivity" android:exported="true" android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode">
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+                 <category android:name="android.intent.category.LAUNCHER" />
+diff --git a/platforms/android/test-app/app/src/main/assets/app/package.json b/platforms/android/test-app/app/src/main/assets/app/package.json
+index cc5e7ba..1db41a9 100644
+--- a/platforms/android/test-app/app/src/main/assets/app/package.json
++++ b/platforms/android/test-app/app/src/main/assets/app/package.json
+@@ -1,17 +1,17 @@
+ {
+-	"main": "boot.js",
+-	"android": {
+-		"v8Flags": "--expose_gc",
+-		"profilerOutputDir": "",
+-		"gcThrottleTime": 500,
+-		"memoryCheckInterval": 10,
+-		"freeMemoryRatio": 0.50,
+-		"markingMode": "none",
+-		"maxLogcatObjectSize": 1024,
+-		"forceLog": false,
+-		"suppressCallJSMethodExceptions": false,
+-		"enableLineBreakpoints": false,
+-		"enableMultithreadedJavascript": true
+-	},
+-	"discardUncaughtJsExceptions": false
++  "main": "boot.js",
++  "android": {
++    "v8Flags": "--expose_gc",
++    "profilerOutputDir": "",
++    "gcThrottleTime": 500,
++    "memoryCheckInterval": 10,
++    "freeMemoryRatio": 0.5,
++    "markingMode": "none",
++    "maxLogcatObjectSize": 1024,
++    "forceLog": false,
++    "suppressCallJSMethodExceptions": false,
++    "enableLineBreakpoints": false,
++    "enableMultithreadedJavascript": false
++  },
++  "discardUncaughtJsExceptions": false
+ }
+\ No newline at end of file
+diff --git a/platforms/android/test-app/app/src/main/resources/lib/arm64-v8a/hwasan.sh b/platforms/android/test-app/app/src/main/resources/lib/arm64-v8a/hwasan.sh
+deleted file mode 100644
+index 88445fc..0000000
+--- a/platforms/android/test-app/app/src/main/resources/lib/arm64-v8a/hwasan.sh
++++ /dev/null
+@@ -1,2 +0,0 @@
+-#!/system/bin/sh
+-LD_HWASAN=1 exec "$@"
+diff --git a/platforms/android/test-app/app/src/main/resources/lib/arm64-v8a/wrap.sh b/platforms/android/test-app/app/src/main/resources/lib/arm64-v8a/wrap.sh
+deleted file mode 100644
+index 45ef2c9..0000000
+--- a/platforms/android/test-app/app/src/main/resources/lib/arm64-v8a/wrap.sh
++++ /dev/null
+@@ -1,22 +0,0 @@
+-#!/system/bin/sh
+-#!/system/bin/sh
+-HERE=$(cd "$(dirname "$0")" && pwd)
+-
+-cmd=$1
+-shift
+-
+-# This must be called *before* `LD_PRELOAD` is set. Otherwise, if this is a 32-
+-# bit app running on a 64-bit device, the 64-bit getprop will fail to load
+-# because it will preload a 32-bit ASan runtime.
+-# https://github.com/android/ndk/issues/1744
+-os_version=$(getprop ro.build.version.sdk)
+-
+-if [ "$os_version" -eq "27" ]; then
+-  cmd="$cmd -Xrunjdwp:transport=dt_android_adb,suspend=n,server=y -Xcompiler-option --debuggable $@"
+-elif [ "$os_version" -eq "28" ]; then
+-  cmd="$cmd -XjdwpProvider:adbconnection -XjdwpOptions:suspend=n,server=y -Xcompiler-option --debuggable $@"
+-else
+-  cmd="$cmd -XjdwpProvider:adbconnection -XjdwpOptions:suspend=n,server=y $@"
+-fi
+-
+-NS_DISABLE_SIGHANDLER=1 LD_HWASAN=1 exec $cmd
+diff --git a/platforms/android/test-app/runtime/CMakeLists.txt b/platforms/android/test-app/runtime/CMakeLists.txt
+index d12df14..06af38a 100644
+--- a/platforms/android/test-app/runtime/CMakeLists.txt
++++ b/platforms/android/test-app/runtime/CMakeLists.txt
+@@ -211,19 +211,13 @@ if (QUICKJS OR QUICKJS_NG)
+     set(QJS_SOURCE_DIR ${VENDOR_DIR}/quickjs/source_ng)
+     add_compile_definitions(__QUICKJS_NG__)
+ 
+-    set(SOURCES ${SOURCES}
+-            # quickjs
+-            # NOTE: no cutils.c -- upstream folded it away after v0.11.0; the
+-            # pinned commit no longer ships it.
+-            ${QJS_SOURCE_DIR}/libregexp.c
+-            ${QJS_SOURCE_DIR}/libunicode.c
+-            ${QJS_SOURCE_DIR}/quickjs.c
+-            ${QJS_SOURCE_DIR}/dtoa.c
+-    )
++    # The host app owns the engine and Node-API: both resolve from its library
++    # at load time.
++    add_compile_definitions(NSH_EXTERNAL_ENGINE)
++    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
+ 
+     if (NS_BINDING STREQUAL "napi")
+         set(SOURCES ${SOURCES}
+-                ${VENDOR_DIR}/quickjs/quickjs-api.c
+                 ${NS_NAPI_DIR}/quickjs/jsr.cpp)
+     endif ()
+ 
+@@ -395,6 +389,8 @@ MESSAGE(STATUS "# CMAKE_CXX_FLAGS: " ${CMAKE_CXX_FLAGS})
+ # Command info: https://cmake.org/cmake/help/v3.4/command/target_link_libraries.html
+ # linking custom STL libraries to the runtime (NativeScript library)
+ target_link_libraries(NativeScript ${PROJECT_SOURCE_DIR}/src/main/libs/common/${ANDROID_ABI}/libzip.a)
++# Node-API and the engine come from the host app's library, loaded first.
++target_link_libraries(NativeScript ${PROJECT_SOURCE_DIR}/../../../../../../apps/android-host/jniLibs/${ANDROID_ABI}/libnsh.so)
+ #target_link_libraries(NativeScript ${PROJECT_SOURCE_DIR}/src/main/libs/common/${ANDROID_ABI}/libclang_rt.asan-aarch64-android.so)
+ 
+ if (HERMES OR SHERMES)
+diff --git a/platforms/android/test-app/runtime/build.gradle b/platforms/android/test-app/runtime/build.gradle
+index a360b2e..eb3e4c5 100644
+--- a/platforms/android/test-app/runtime/build.gradle
++++ b/platforms/android/test-app/runtime/build.gradle
+@@ -9,7 +9,7 @@ def hasEngine = project.hasProperty("engine")
+ if (hasEngine) {
+     jsEngine = engine
+ }
+-def hasHostObjects = true //project.hasProperty("useHostObjects")
++def hasHostObjects = false //project.hasProperty("useHostObjects")
+ 
+ // Which runtime to compile. These are two complete parallel implementations,
+ // not a runtime plus a shim:

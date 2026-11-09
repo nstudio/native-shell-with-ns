@@ -1,0 +1,35 @@
+[package]
+name = "nsh-ns"
+version = "0.1.0"
+edition = "2024"
+publish = false
+workspace = "../../vendor/nsh"
+
+[[bin]]
+name = "nsh-ns"
+path = "src/main.rs"
+
+[features]
+dev = ["nsh-platform-macos/dev", "nsh-platform-ios/dev"]
+
+[dependencies]
+nsh-js = { path = "../../vendor/nsh/crates/nsh-js", default-features = false }
+nsh-engine = { path = "../../vendor/nsh/crates/nsh-engine" }
+env_logger = "0.11"
+nsh-core.workspace = true
+nsh-base.workspace = true
+dispatch2.workspace = true
+objc2-foundation = { workspace = true, features = ["NSProcessInfo", "NSString"] }
+objc2 = { workspace = true }
+serde_json.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { path = "../../vendor/nsh/crates/nsh-platform-macos" }
+objc2-app-kit = { workspace = true, features = ["NSStatusBar", "NSStatusItem", "NSButton", "NSControl", "NSResponder", "NSView", "NSAccessibilityProtocols"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+nsh-platform-ios = { path = "../../vendor/nsh/crates/nsh-platform-ios" }
+objc2-ui-kit = { workspace = true, features = ["UIView", "UIResponder"] }
+
+[build-dependencies]
+cc = "1"
